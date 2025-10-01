@@ -1,8 +1,10 @@
 # gpt2-repro-124M
+
 Reimplementation of GPT-2 (124M) from scratch in PyTorch, following Karpathy’s walkthrough.
+
 ---
 
-## 📖 Introduction
+## Introduction
 This project aims to **reproduce GPT-2 (124M) from scratch** in PyTorch, following Andrej Karpathy’s walkthrough.  
 Goal: deepen understanding of **Transformer architecture**, training optimization, and scaling behavior.
 ---
