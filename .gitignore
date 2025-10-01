@@ -205,3 +205,58 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ===== Python Basics =====
+__pycache__/              # Compiled Python bytecode files (cache); not needed in repo
+*.py[cod]                 # Compiled Python files (*.pyc, *.pyo, *.pyd)
+*$py.class                # Temporary compiled class files
+*.pyo                     # Obsolete optimized Python files
+*.egg-info/               # Package metadata created by setuptools
+*.egg                     # Python Egg distribution file
+.eggs/                    # Egg build artifacts
+*.log                     # Log files (runtime/training logs)
+
+# ===== Virtual Environments =====
+env/                      # Common name for a Python virtual environment
+.venv/                    # Hidden virtual environment folder
+venv/                     # Another common name for virtual environments
+ENV/                      # Alternate naming convention for env folder
+.venv*/                   # Any hidden env variations
+pip-wheel-metadata/       # Metadata created during pip install
+
+# ===== Jupyter =====
+.ipynb_checkpoints/       # Auto-saved notebook checkpoints
+*.ipynb_checkpoints       # Any file with .ipynb_checkpoints in name
+
+# ===== Editor / System Files =====
+.vscode/                  # Visual Studio Code workspace settings
+.idea/                    # JetBrains IDE (PyCharm) project settings
+.DS_Store                 # macOS system file (stores folder view settings)
+Thumbs.db                 # Windows system file (stores thumbnail cache)
+
+# ===== PyTorch / Deep Learning =====
+*.pt                      # PyTorch model checkpoint files
+*.pth                     # PyTorch saved models
+*.ckpt                    # Generic checkpoint files (e.g. Lightning)
+*.bin                     # Model weights (common in HuggingFace models)
+*.onnx                    # Exported ONNX models
+
+# TensorBoard
+runs/                     # TensorBoard log directory
+events.out.tfevents.*     # TensorBoard event log files
+
+# ===== Data Cache =====
+data/                     # Local dataset folder (keep large files out of repo)
+*.tar.gz                  # Compressed dataset archive
+*.zip                     # Compressed archive
+*.jsonl                   # Large JSON lines data files
+*.h5                      # HDF5 data files
+*.pkl                     # Pickle serialized files
+
+# ===== Build / Compiled Artifacts =====
+build/                    # Build output folder
+dist/                     # Distribution folder for packages
+*.so                      # Compiled shared objects (Linux)
+*.dll                     # Dynamic link libraries (Windows)
+*.dylib                   # Dynamic libraries (macOS)
+
