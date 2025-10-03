@@ -218,6 +218,8 @@ class GPT(nn.Module):
         ))
         # Language modeling head: project hidden states back to vocab size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+    
+    # NOTE: fix bug 
         
     def forward(self, idx, targets=None):
         '''
@@ -375,7 +377,89 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    
+import tiktoken   # OpenAI's fast tokenizer library, here we use GPT-2 BPE encoding
 
+class DataLoaderLite:
+    def __init__(self, B, T):
+        """
+        Initialize the data loader.
+
+        Args:
+            B (int): batch size (number of sequences per batch)
+            T (int): sequence length (number of tokens per sequence)
+        """
+        self.B = B
+        self.T = T
+
+        # ---------------------------------------------------------
+        # 1. Load raw text from disk and encode it into tokens
+        # ---------------------------------------------------------
+        with open('input.txt', 'r') as f:
+            text = f.read()   # read the whole file into a string
+        enc = tiktoken.get_encoding('gpt2')  # use GPT-2 tokenizer
+        tokens = enc.encode(text)            # convert text → list of token IDs
+        self.tokens = torch.tensor(tokens)   # store as PyTorch tensor
+
+        print(f"loaded {len(self.tokens)} tokens")  # total number of tokens in dataset
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        # Explanation:
+        # - One "epoch" means processing the entire dataset once.
+        # - Each batch consumes B*T tokens.
+        # - So total number of batches per epoch = total_tokens // (B*T)
+
+        # ---------------------------------------------------------
+        # 2. Initialize state (where we are in the dataset)
+        # ---------------------------------------------------------
+        self.current_position = 0   # index pointer into the token tensor
+
+        def next_batch(self):
+            """
+            Return the next batch of training data (x, y).
+            Each batch is shaped:
+                x: (B, T) input tokens
+                y: (B, T) target tokens (shifted by 1)
+            """
+            B, T = self.B, self.T
+
+            # ---------------------------------------------------------
+            # 1. Slice a chunk of (B*T + 1) tokens from the dataset.
+            # We need +1 because y is shifted by one token relative to x.
+            # ---------------------------------------------------------
+            buf = self.tokens[self.current_position : self.current_position+B*T+1]
+
+            # ---------------------------------------------------------
+            # 2. Create input (x) and target (y) sequences.
+            # - x is all but the last token, reshaped into (B, T)
+            # - y is all but the first token, reshaped into (B, T)
+            # Example:
+            #   buf = [t1, t2, t3, t4, t5]
+            #   x   = [t1, t2, t3, t4]
+            #   y   = [t2, t3, t4, t5]
+            # ---------------------------------------------------------
+            x = (buf[:-1]).view(B, T)  # inputs
+            y = (buf[1:]).view(B, T)   # targets
+
+            # ---------------------------------------------------------
+            # 3. Advance the current position by B*T tokens.
+            # This means "move forward one batch".
+            # ---------------------------------------------------------
+            self.current_position += B * T
+
+            # ---------------------------------------------------------
+            # 4. If we've reached the end of the dataset,
+            # reset back to the beginning for the next epoch.
+            # ---------------------------------------------------------
+            if self.current_position + (B * T + 1) > len(self.tokens):
+                self.current_position = 0
+
+            # ---------------------------------------------------------
+            # 5. Return a pair (x, y) for training.
+            # ---------------------------------------------------------
+            return x, y
+
+    
 # --------------------------------------------------------------
 # Test: load small GPT-2 (124M) and check if it runs
 
@@ -391,19 +475,20 @@ print(f"using device: {device}")
 
 
 # get a data batch
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])
-# NOTE: be careful
-buf = buf.to(device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+# import tiktoken
+# enc = tiktoken.get_encoding('gpt2')
+# with open('input.txt', 'r') as f:
+#     text = f.read()
+# text = text[:1000]
+# tokens = enc.encode(text)
+# B, T = 4, 32
+# buf = torch.tensor(tokens[:B*T + 1])
+# # NOTE: be careful
+# buf = buf.to(device)
+# x = buf[:-1].view(B, T)
+# y = buf[1:].view(B, T)
 
+train_loader = DataLoaderLite(B=4, T=32)
 # get logits
 model = GPT(GPTConfig())
 
@@ -423,6 +508,9 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 # Training loop for 50 iterations (steps).
 for i in range(50):
 
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    
     # --------------------------------------------------------
     # 1. Zero out (reset) the gradients from the previous step.
     # PyTorch accumulates gradients by default, so we must clear
@@ -455,6 +543,7 @@ for i in range(50):
 
 
 print(loss)
+
 import sys; sys.exit(0)
 
 # prefix tokens
