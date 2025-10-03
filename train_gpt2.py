@@ -36,6 +36,9 @@ class CausalSelfAttention(nn.Module):
         # Linear projection for the output of attention (to mix heads back together)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
 
+        # NOTE: follow the paper, scale using number of residual layers
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+        
         # Store number of heads and embedding size
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -108,6 +111,8 @@ class MLP(nn.Module):   # NOTE: should be nn.Module, not nn.module
         # Projects the expanded dimension back down: 4 * n_embd → n_embd.
         # This restores the hidden size so it can be added back to the residual stream.
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        # NOTE: follow the paper, scale using number of residual layers
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         
     def forward(self, x):
         # Step 1: Project input up to 4 * n_embd
@@ -230,7 +235,11 @@ class GPT(nn.Module):
         if isinstance(module, nn.Linear):
             # Initialize weights from a normal distribution
             # mean = 0.0, std = 0.02
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = 0.02
+            
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= 2 * (self.config.n_layers) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             
             # If the Linear layer has a bias term, set it to zeros
             if module.bias is not None:
@@ -494,6 +503,10 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 
 print(f"using device: {device}")
 
+# Set seed for reproducibility
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
 # get a data batch
 # import tiktoken
