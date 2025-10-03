@@ -219,7 +219,28 @@ class GPT(nn.Module):
         # Language modeling head: project hidden states back to vocab size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     
-    # NOTE: fix bug 
+        # NOTE: fix bug 
+        # weight sharing scheme:
+        # details: attention is all you need paper and 30-th refer
+        # one way to do it
+        self.transformer.wte.weight = self.lm_head.weight
+    
+    def _init_weights(self, module):
+        # Check if the module is a Linear layer (nn.Linear)
+        if isinstance(module, nn.Linear):
+            # Initialize weights from a normal distribution
+            # mean = 0.0, std = 0.02
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            
+            # If the Linear layer has a bias term, set it to zeros
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+        # Check if the module is an Embedding layer (nn.Embedding)
+        elif isinstance(module, nn.Embedding):
+            # Initialize embedding weights from the same normal distribution
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        
         
     def forward(self, idx, targets=None):
         '''
