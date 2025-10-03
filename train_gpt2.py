@@ -219,72 +219,143 @@ class GPT(nn.Module):
         # Language modeling head: project hidden states back to vocab size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
-    def forward(self, idx):
-        # idx is of shape (B, T)
+    def forward(self, idx, targets=None):
+        '''
+        Input token IDs → convert to token embeddings
+        Add position embeddings (so model knows order)
+        Pass through stacked Transformer blocks (attention + MLP)
+        Apply final LayerNorm
+        Project to vocabulary logits (next-token prediction)
+        '''
+        # idx is the input sequence of token IDs
+        # Shape: (B, T) where:
+        #   B = batch size (number of sequences)
+        #   T = sequence length (number of tokens in each sequence)
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
-        # forward the token and posisition embeddings
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
-        x = tok_emb + pos_emb # hidden broadcasting
-        # forward the blocks of the transformer
+
+        # Ensure sequence length does not exceed the maximum context length (block_size).
+        # If T > block_size, the model cannot handle it and raises an error.
+        assert T <= self.config.block_size, (
+            f"Cannot forward sequence of length {T}, "
+            f"block size is only {self.config.block_size}"
+        )
+
+        # -------------------------------------------------------
+        # 1. Compute position indices
+        # torch.arange(0, T) creates [0, 1, 2, ..., T-1]
+        # Shape: (T,)
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+
+        # 2. Get position embeddings
+        # Each position (0..T-1) maps to a learned embedding vector.
+        # Shape: (T, n_embd)
+        pos_emb = self.transformer.wpe(pos)
+
+        # 3. Get token embeddings
+        # Each token ID in idx maps to its embedding vector.
+        # Shape: (B, T, n_embd)
+        tok_emb = self.transformer.wte(idx)
+
+        # 4. Add token embeddings + position embeddings
+        # Broadcasting happens: pos_emb (T, n_embd) is added to each sequence in tok_emb.
+        # Result shape: (B, T, n_embd)
+        x = tok_emb + pos_emb
+
+        # -------------------------------------------------------
+        # 5. Pass through all Transformer blocks (stacked layers).
+        # Each block applies: LayerNorm → Self-Attention → MLP → Residual connections
         for block in self.transformer.h:
-            x = block(x)
-        # forward the final layernorm and the classifier
+            x = block(x)   # still (B, T, n_embd)
+
+        # -------------------------------------------------------
+        # 6. Final layer normalization before output
+        # Shape: (B, T, n_embd)
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x) # (B, T, vocab_size)
-        return logits
+        
+
+        # 7. Project hidden states to vocabulary logits
+        # Linear layer maps each embedding (n_embd) → vocab_size
+        # Shape: (B, T, vocab_size)
+        logits = self.lm_head(x)
+        
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), 
+                                   targets.view(-1))
+
+        # -------------------------------------------------------
+        # Return raw logits (before softmax).
+        # Each position has a probability distribution over the vocabulary.
+        return logits, loss
+
+    
     # ===========================================================
     @classmethod
     def from_pretrained(cls, model_type):
         """Load pretrained GPT-2 model weights from HuggingFace checkpoints"""
         
-        # Only allow valid GPT-2 variants
+        # ✅ Step 1: Ensure the requested model_type is valid
+        # We only allow official GPT-2 variants (small, medium, large, xl).
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        
+        # Import HuggingFace's GPT-2 implementation
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
-        # Different GPT-2 variants have different n_layer, n_head, n_embd
+        # ✅ Step 2: Choose architecture hyperparameters based on model_type
+        # Each GPT-2 variant has a different depth (n_layer), number of heads (n_head),
+        # and hidden embedding size (n_embd).
+        # These define the size of the neural network.
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),   # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),   # ~124M parameters
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # ~350M parameters
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # ~774M parameters
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # ~1558M parameters
         }[model_type]
 
-        # vocab size and block size are always fixed for GPT-2
-        config_args['vocab_size'] = 50257
-        config_args['block_size'] = 1024
+        # ✅ Step 3: Add GPT-2 constants
+        # Vocabulary size and context window size are always fixed for GPT-2 models.
+        config_args['vocab_size'] = 50257   # GPT-2 BPE vocabulary size
+        config_args['block_size'] = 1024    # Max sequence length (context size)
 
-        # Create our own GPT instance from scratch with the same config
+        # ✅ Step 4: Create our own GPT model (from scratch) with this config
+        # This initializes random weights, not pretrained ones yet.
         config = GPTConfig(**config_args)
         model = GPT(config)
 
-        # Grab its state_dict (all parameters)
+        # ✅ Step 5: Collect the parameter dictionary of our model
+        # `state_dict` = all learnable parameters (weights, biases)
         sd = model.state_dict()
         sd_keys = sd.keys()
-        # Exclude attention bias buffer (not learnable, just a mask)
+
+        # Remove the attention bias mask from our keys
+        # Because this buffer is not learnable (just a causal mask).
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
 
         # ------------------------------------------------------
-        # Load the HuggingFace model with pretrained weights
+        # ✅ Step 6: Load HuggingFace's pretrained GPT-2 model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        # HuggingFace also has some buffer keys we can ignore
+        # ✅ Step 7: Clean up HuggingFace parameter keys
+        # They also have some buffer parameters we don’t care about.
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
 
-        # Some layers in HuggingFace are stored as Conv1D,
-        # while we use plain Linear → need to transpose weights.
+        # ✅ Step 8: Define which weights need transposition
+        # HuggingFace uses a custom "Conv1D" layer for efficiency,
+        # while our implementation uses standard nn.Linear.
+        # Conv1D stores weights as (out_features, in_features),
+        # while nn.Linear expects (in_features, out_features).
+        # → So we need to transpose these weights when copying.
         transposed = [
-            'attn.c_attn.weight',
-            'attn.c_proj.weight',
-            'mlp.c_fc.weight',
-            'mlp.c_proj.weight'
+            'attn.c_attn.weight',   # Attention QKV projection
+            'attn.c_proj.weight',   # Attention output projection
+            'mlp.c_fc.weight',      # MLP expansion layer
+            'mlp.c_proj.weight'     # MLP projection layer
         ]
+
 
         # Sanity check: number of parameters must match
         assert len(sd_keys_hf) == len(sd_keys), \
@@ -307,5 +378,126 @@ class GPT(nn.Module):
 
 # --------------------------------------------------------------
 # Test: load small GPT-2 (124M) and check if it runs
-model = GPT.from_pretrained('gpt2')
-print("didn't crash yay!")
+
+# attempt to autodetect the device
+device = "cpu"   
+
+if torch.cuda.is_available():
+    device = "cuda"   
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"    
+
+print(f"using device: {device}")
+
+
+# get a data batch
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+# NOTE: be careful
+buf = buf.to(device)
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+# get logits
+model = GPT(GPTConfig())
+
+model.to(device)
+# logits, loss = model(x, y)
+
+# ============================================================
+# Optimization loop: trains the model parameters using AdamW
+# ============================================================
+
+# Create the optimizer.
+# - AdamW = Adam optimizer with decoupled weight decay (better for transformers).
+# - model.parameters() tells the optimizer which parameters to update.
+# - lr = learning rate, 3e-4 means step size for each parameter update.
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+# Training loop for 50 iterations (steps).
+for i in range(50):
+
+    # --------------------------------------------------------
+    # 1. Zero out (reset) the gradients from the previous step.
+    # PyTorch accumulates gradients by default, so we must clear
+    # them before each backward pass.
+    optimizer.zero_grad()
+
+    # --------------------------------------------------------
+    # 2. Forward pass: feed input (x) and target (y) into the model.
+    # The model returns:
+    #   - logits: raw predictions of shape (B, T, vocab_size)
+    #   - loss:   cross-entropy loss between logits and y
+    logits, loss = model(x, y)
+
+    # --------------------------------------------------------
+    # 3. Backward pass: compute gradients of the loss
+    # with respect to all learnable parameters in the model.
+    # This uses automatic differentiation.
+    loss.backward()
+
+    # --------------------------------------------------------
+    # 4. Optimization step: update parameters using the computed gradients.
+    # Each parameter θ is updated like:
+    #   θ_new = θ_old - lr * gradient(θ)
+    optimizer.step()
+
+    # --------------------------------------------------------
+    # 5. Print training progress.
+    # .item() converts a PyTorch scalar tensor to a regular Python float.
+    print(f"step {i}, loss: {loss.item()}")
+
+
+print(loss)
+import sys; sys.exit(0)
+
+# prefix tokens
+model.eval()
+num_return_sequences = 5
+max_length = 30
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to('cuda')
+
+# generate! right now x is (B, T) where B = 5, T = 8
+# set the seed to 42
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get the logits
+    with torch.no_grad():
+        logits = model(x) # (B, T, vocab_size)
+        # take the logits at the last position
+        logits = logits[:, -1, :] # (B, vocab_size)
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probabilities
+        # note: multinomial does not demand the input to sum to 1
+        ix = torch.multinomial(topk_probs, 1) # (B, 1)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1)
+
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
