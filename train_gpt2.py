@@ -578,7 +578,12 @@ for i in range(50):
 
 print(loss)
 
+# exit if needed
 import sys; sys.exit(0)
+
+ # --------------------------------------------------------
+ # Inference
+  # --------------------------------------------------------
 
 # prefix tokens
 model.eval()
