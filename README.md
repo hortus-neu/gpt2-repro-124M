@@ -1,6 +1,6 @@
 # gpt2-repro-124M
 
-Reimplementation of GPT-2 (124M) from scratch in PyTorch, following Karpathy’s walkthrough.
+Reimplementation of GPT-2 (124M) from scratch in PyTorch, using OpenAI checkpoint, and following Karpathy’s walkthrough.
 
 ---
 
@@ -25,7 +25,7 @@ gpt2-repro/
 ---
 
 ## Tech Stack
-- **Language**: Python 3.10+
+- **Language**: Python 3.11+
 - **Framework**: PyTorch
 - **Acceleration**: CUDA / Mixed Precision
 - **Tokenizer**: HuggingFace GPT-2 tokenizer
@@ -38,7 +38,7 @@ gpt2-repro/
    git clone https://github.com/<your-username>/gpt2-repro.git
    cd gpt2-repro
    pip install -r requirements.txt
-```
+   ```
 
 2. Train the model:
 
@@ -65,5 +65,5 @@ gpt2-repro/
 * [Karpathy’s video: *Let’s Reproduce GPT-2 (124M)*](https://www.youtube.com/watch?v=l8pRSuU81PU)
 * [OpenAI GPT-2 Paper (2019)](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)
 * [Karpathy’s build-nanogpt repo](https://github.com/karpathy/build-nanogpt)
-
+* [Attention is all you need]
 
