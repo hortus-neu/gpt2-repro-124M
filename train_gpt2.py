@@ -66,17 +66,19 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Compute raw attention scores: (Q x K^T) / sqrt(head_size)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1) ** 0.5))
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
 
-        # Apply causal mask: prevent attending to future positions
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # # Compute raw attention scores: (Q x K^T) / sqrt(head_size)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1) ** 0.5))
 
-        # Softmax over the last dimension (sequence length) to get probabilities
-        att = F.softmax(att, dim=-1)
+        # # Apply causal mask: prevent attending to future positions
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
 
-        # Weighted sum of values using the attention weights
-        y = att @ v   # Shape: (B, nh, T, hs)
+        # # Softmax over the last dimension (sequence length) to get probabilities
+        # att = F.softmax(att, dim=-1)
+
+        # # Weighted sum of values using the attention weights
+        # y = att @ v   # Shape: (B, nh, T, hs)
 
         # Rearrange back: transpose and merge heads
         y = y.transpose(1, 2).contiguous().view(B, T, C)
