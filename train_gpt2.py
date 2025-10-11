@@ -1,20 +1,20 @@
-# Import the dataclass decorator to easily create configuration classes 
+# Import the dataclass decorator to easily create configuration classes
 
 import math
 
 # with default values and type hints.
-from dataclasses import dataclass  
+from dataclasses import dataclass
 
 # Import the main PyTorch library (used for tensors and core functions).
-import torch  
+import torch
 
 # Import the neural network module from PyTorch.
 # This provides layers like Linear, Embedding, LayerNorm, etc.
-import torch.nn as nn  
+import torch.nn as nn
 
 # Import the functional API from torch.nn.
 # This contains stateless functions (like activation functions, loss functions).
-from torch.nn import functional as F  
+from torch.nn import functional as F
 
 # --------------------------------------------------------- #
 
@@ -38,7 +38,7 @@ class CausalSelfAttention(nn.Module):
 
         # NOTE: follow the paper, scale using number of residual layers
         self.c_proj.NANOGPT_SCALE_INIT = 1
-        
+
         # Store number of heads and embedding size
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -62,9 +62,9 @@ class CausalSelfAttention(nn.Module):
 
         # Reshape to separate attention heads
         # Shape: (B, nh, T, hs) where hs = head size = n_embd / n_head
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
         # Compute raw attention scores: (Q x K^T) / sqrt(head_size)
         att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1) ** 0.5))
@@ -79,7 +79,7 @@ class CausalSelfAttention(nn.Module):
         y = att @ v   # Shape: (B, nh, T, hs)
 
         # Rearrange back: transpose and merge heads
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # Final output projection
         y = self.c_proj(y)
@@ -92,38 +92,38 @@ class CausalSelfAttention(nn.Module):
 # with a GELU activation in between.
 # =======================================
 class MLP(nn.Module):   # NOTE: should be nn.Module, not nn.module
-    
+
     def __init__(self, config):
         # Initialize the parent nn.Module
         super().__init__()
-        
+
         # First linear projection (c_fc):
         # Expands the hidden dimension from n_embd → 4 * n_embd.
         # This widening allows the model to capture more complex transformations.
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        
+
         # Activation function:
         # GELU (Gaussian Error Linear Unit) is used instead of ReLU.
         # The 'approximate="tanh"' version is slightly faster and commonly used.
         self.gelu = nn.GELU(approximate='tanh')
-        
+
         # Second linear projection (c_proj):
         # Projects the expanded dimension back down: 4 * n_embd → n_embd.
         # This restores the hidden size so it can be added back to the residual stream.
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
         # NOTE: follow the paper, scale using number of residual layers
         self.c_proj.NANOGPT_SCALE_INIT = 1
-        
+
     def forward(self, x):
         # Step 1: Project input up to 4 * n_embd
         x = self.c_fc(x)
-        
+
         # Step 2: Apply GELU non-linearity (smooth activation)
         x = self.gelu(x)
-        
+
         # Step 3: Project back down to n_embd
         x = self.c_proj(x)
-        
+
         # Return the transformed output
         return x
 
@@ -138,43 +138,43 @@ class MLP(nn.Module):   # NOTE: should be nn.Module, not nn.module
 # 4. Feed-forward MLP
 # 5. Residual (skip) connections around attention and MLP
 class Block(nn.Module):
-    
+
     def __init__(self, config):
         super().__init__()
-        
+
         # First LayerNorm: applied before self-attention.
         # Helps stabilize training and normalize hidden states.
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        
+
         # Multi-head causal self-attention module.
         # "Causal" means tokens cannot attend to future positions,
         # ensuring autoregressive prediction (next-token generation).
         self.attn = CausalSelfAttention(config)
-        
+
         # Second LayerNorm: applied before the feed-forward MLP.
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        
+
         # Position-wise feed-forward network (MLP).
         # Usually: Linear → GELU → Linear
         # Expands and contracts the hidden dimension.
         self.mlp = MLP(config)
-        
+
     def forward(self, x):
         # Apply LayerNorm → Attention, then add back the original input (residual connection).
         # This means: new_x = x + Attention(LayerNorm(x))
         x = x + self.attn(self.ln_1(x))
-        
+
         # Apply LayerNorm → MLP, then again add residual connection.
         # new_x = x + MLP(LayerNorm(x))
         x = x + self.mlp(self.ln_2(x))
-        
+
         # Return the updated hidden states.
         return x
-    
+
 # =======================================
-# The @dataclass decorator automatically generates 
-# useful methods for the class (like __init__, __repr__). 
-# This makes it very convenient to define configuration objects 
+# The @dataclass decorator automatically generates
+# useful methods for the class (like __init__, __repr__).
+# This makes it very convenient to define configuration objects
 # with default values and type hints.
 # =======================================
 @dataclass
@@ -182,27 +182,27 @@ class GPTConfig:
     # Maximum context length (sequence length) the model can handle.
     # Example: 256 means the model can look at 256 tokens at once.
     block_size: int = 1024    # max sequence length (GPT-2 context window)
-    
+
     # Size of the vocabulary (number of unique tokens/characters/words).
     # Each token ID in [0, vocab_size) maps to an embedding vector.
     vocab_size: int = 50257   # vocabulary size (BPE tokens)
-    
+
     # Number of Transformer blocks (layers) to stack in the model.
     # Each block = self-attention + feed-forward + residual connections.
     n_layer: int = 12         # number of transformer layers
-    
+
     # Number of attention heads inside each multi-head attention layer.
     # Each head learns different "attention patterns".
     n_head: int = 12          # number of attention heads
-    
+
     # Dimensionality of the embedding vector for each token.
     # Also the hidden size of the model (width of the layers).
     n_embd: int = 768         # embedding/hidden dimension
- 
+
 # =========================================================
 # Define the main GPT model class, which inherits from PyTorch's nn.Module.
 # The skeleton of GPT2.
-# tokens → embeddings + positions → stacked transformer blocks → normalization → linear head → logits   
+# tokens → embeddings + positions → stacked transformer blocks → normalization → linear head → logits
 # =========================================================
 class GPT(nn.Module):
 
@@ -223,24 +223,24 @@ class GPT(nn.Module):
         ))
         # Language modeling head: project hidden states back to vocab size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-    
-        # NOTE: fix bug 
+
+        # NOTE: fix bug
         # weight sharing scheme:
         # details: attention is all you need paper and 30-th refer
         # one way to do it
         self.transformer.wte.weight = self.lm_head.weight
-    
+
     def _init_weights(self, module):
         # Check if the module is a Linear layer (nn.Linear)
         if isinstance(module, nn.Linear):
             # Initialize weights from a normal distribution
             # mean = 0.0, std = 0.02
             std = 0.02
-            
+
             if hasattr(module, "NANOGPT_SCALE_INIT"):
                 std *= 2 * (self.config.n_layers) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            
+
             # If the Linear layer has a bias term, set it to zeros
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -249,8 +249,8 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             # Initialize embedding weights from the same normal distribution
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        
-        
+
+
     def forward(self, idx, targets=None):
         '''
         Input token IDs → convert to token embeddings
@@ -303,16 +303,16 @@ class GPT(nn.Module):
         # 6. Final layer normalization before output
         # Shape: (B, T, n_embd)
         x = self.transformer.ln_f(x)
-        
+
 
         # 7. Project hidden states to vocabulary logits
         # Linear layer maps each embedding (n_embd) → vocab_size
         # Shape: (B, T, vocab_size)
         logits = self.lm_head(x)
-        
+
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), 
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
                                    targets.view(-1))
 
         # -------------------------------------------------------
@@ -320,16 +320,16 @@ class GPT(nn.Module):
         # Each position has a probability distribution over the vocabulary.
         return logits, loss
 
-    
+
     # ===========================================================
     @classmethod
     def from_pretrained(cls, model_type):
         """Load pretrained GPT-2 model weights from HuggingFace checkpoints"""
-        
+
         # ✅ Step 1: Ensure the requested model_type is valid
         # We only allow official GPT-2 variants (small, medium, large, xl).
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        
+
         # Import HuggingFace's GPT-2 implementation
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
@@ -407,8 +407,8 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-    
-    
+
+
 import tiktoken   # OpenAI's fast tokenizer library, here we use GPT-2 BPE encoding
 
 class DataLoaderLite:
@@ -489,17 +489,17 @@ class DataLoaderLite:
         # ---------------------------------------------------------
         return x, y
 
-    
+
 # --------------------------------------------------------------
 # Test: load small GPT-2 (124M) and check if it runs
 import time
 # attempt to autodetect the device
-device = "cpu"   
+device = "cpu"
 
 if torch.cuda.is_available():
-    device = "cuda"   
+    device = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"    
+    device = "mps"
 
 print(f"using device: {device}")
 
@@ -524,6 +524,7 @@ if torch.cuda.is_available():
 
 train_loader = DataLoaderLite(B=16, T=1024)
 
+# to see the difference
 torch.set_float32_matmul_precision('high')
 # get logits
 model = GPT(GPTConfig())
@@ -546,7 +547,7 @@ for i in range(50):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
-    
+
     # --------------------------------------------------------
     # 1. Zero out (reset) the gradients from the previous step.
     # PyTorch accumulates gradients by default, so we must clear
@@ -558,7 +559,8 @@ for i in range(50):
     # The model returns:
     #   - logits: raw predictions of shape (B, T, vocab_size)
     #   - loss:   cross-entropy loss between logits and y
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
 
     # --------------------------------------------------------
     # 3. Backward pass: compute gradients of the loss
