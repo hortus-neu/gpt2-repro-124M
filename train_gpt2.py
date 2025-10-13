@@ -543,7 +543,8 @@ model = torch.compile(model)
 # - AdamW = Adam optimizer with decoupled weight decay (better for transformers).
 # - model.parameters() tells the optimizer which parameters to update.
 # - lr = learning rate, 3e-4 means step size for each parameter update.
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95)
+                              ,eps=1e-8)
 
 # Training loop for 50 iterations (steps).
 for i in range(50):
