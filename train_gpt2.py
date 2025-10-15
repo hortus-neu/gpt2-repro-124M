@@ -1,667 +1,380 @@
-# Import the dataclass decorator to easily create configuration classes
+# ============================================================
+#  GPT-2 Distributed Training & Inference
+# ============================================================
+#  Author: Hortus He
+#  Compatible with: PyTorch ≥ 2.0
+#  Features:
+#     - Supports single-GPU or multi-GPU via torchrun (DDP)
+#     - Gradient accumulation for large effective batch
+#     - Fused AdamW optimizer
+#     - FlashAttention via scaled_dot_product_attention
+# ============================================================
 
-import math
-
-# with default values and type hints.
+import os, math, time
 from dataclasses import dataclass
-
-# Import the main PyTorch library (used for tensors and core functions).
 import torch
-
-# Import the neural network module from PyTorch.
-# This provides layers like Linear, Embedding, LayerNorm, etc.
 import torch.nn as nn
-
-# Import the functional API from torch.nn.
-# This contains stateless functions (like activation functions, loss functions).
 from torch.nn import functional as F
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import tiktoken
+import inspect
 
-# --------------------------------------------------------- #
 
-# =======================================
-# Input x → Q, K, V projection → split into multiple heads → dot-product attention scores → causal mask (prevent looking ahead) → Softmax → weighted sum of values → concatenate heads → final Linear projection → output
-# =======================================
+# ============================================================
+# 1. Transformer Core Modules
+# ============================================================
+
 class CausalSelfAttention(nn.Module):
-
     def __init__(self, config):
-        super().__init__()
 
-        # Make sure embedding size is divisible by number of heads
+        super().__init__()
         assert config.n_embd % config.n_head == 0
 
-        # Linear layer to project input embeddings into Q, K, V (query, key, value)
-        # Instead of three separate matrices, we use one large projection and split later.
+        # dimensions
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-
-        # Linear projection for the output of attention (to mix heads back together)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-
-        # NOTE: follow the paper, scale using number of residual layers
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-
-        # Store number of heads and embedding size
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-        # Causal mask to prevent attending to future tokens
-        # torch.tril creates a lower-triangular matrix (1 = allowed, 0 = masked).
-        # register_buffer means it's stored with the model but not updated by gradients.
+        self.c_proj.NANOGPT_SCALE_INIT = 1 # normalization
+
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(config.block_size, config.block_size))
-            .view(1, 1, config.block_size, config.block_size)
-        )
+                 .view(1, 1, config.block_size, config.block_size)
+        ) # lower-triangular mask
 
     def forward(self, x):
-        # B = batch size, T = sequence length, C = embedding size
         B, T, C = x.size()
-
-        # Project input x into q, k, v (queries, keys, values)
-        qkv = self.c_attn(x)                          # Shape: (B, T, 3*C)
-        q, k, v = qkv.split(self.n_embd, dim=2)       # Split into (B, T, C) each
-
-        # Reshape to separate attention heads
-        # Shape: (B, nh, T, hs) where hs = head size = n_embd / n_head
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
-
-        # # Compute raw attention scores: (Q x K^T) / sqrt(head_size)
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1) ** 0.5))
-
-        # # Apply causal mask: prevent attending to future positions
-        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-
-        # # Softmax over the last dimension (sequence length) to get probabilities
-        # att = F.softmax(att, dim=-1)
-
-        # # Weighted sum of values using the attention weights
-        # y = att @ v   # Shape: (B, nh, T, hs)
-
-        # Rearrange back: transpose and merge heads
+        # flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-
-        # Final output projection
-        y = self.c_proj(y)
-        return y
+        return self.c_proj(y)
 
 
-# =======================================
-# Define the MLP (feed-forward network) used inside each Transformer block.
-# In GPT-style Transformers, this is typically a 2-layer fully connected network
-# with a GELU activation in between.
-# =======================================
-class MLP(nn.Module):   # NOTE: should be nn.Module, not nn.module
-
+class MLP(nn.Module):
     def __init__(self, config):
-        # Initialize the parent nn.Module
         super().__init__()
-
-        # First linear projection (c_fc):
-        # Expands the hidden dimension from n_embd → 4 * n_embd.
-        # This widening allows the model to capture more complex transformations.
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-
-        # Activation function:
-        # GELU (Gaussian Error Linear Unit) is used instead of ReLU.
-        # The 'approximate="tanh"' version is slightly faster and commonly used.
         self.gelu = nn.GELU(approximate='tanh')
-
-        # Second linear projection (c_proj):
-        # Projects the expanded dimension back down: 4 * n_embd → n_embd.
-        # This restores the hidden size so it can be added back to the residual stream.
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-        # NOTE: follow the paper, scale using number of residual layers
         self.c_proj.NANOGPT_SCALE_INIT = 1
-
     def forward(self, x):
-        # Step 1: Project input up to 4 * n_embd
-        x = self.c_fc(x)
-
-        # Step 2: Apply GELU non-linearity (smooth activation)
-        x = self.gelu(x)
-
-        # Step 3: Project back down to n_embd
-        x = self.c_proj(x)
-
-        # Return the transformed output
-        return x
+        return self.c_proj(self.gelu(self.c_fc(x)))
 
 
-# =======================================
-# Define a single Transformer block.
-# =======================================
-# Each block consists of:
-# 1. LayerNorm
-# 2. Multi-head self-attention (causal, so it only looks at past tokens)
-# 3. Another LayerNorm
-# 4. Feed-forward MLP
-# 5. Residual (skip) connections around attention and MLP
 class Block(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-
-        # First LayerNorm: applied before self-attention.
-        # Helps stabilize training and normalize hidden states.
         self.ln_1 = nn.LayerNorm(config.n_embd)
-
-        # Multi-head causal self-attention module.
-        # "Causal" means tokens cannot attend to future positions,
-        # ensuring autoregressive prediction (next-token generation).
         self.attn = CausalSelfAttention(config)
-
-        # Second LayerNorm: applied before the feed-forward MLP.
         self.ln_2 = nn.LayerNorm(config.n_embd)
-
-        # Position-wise feed-forward network (MLP).
-        # Usually: Linear → GELU → Linear
-        # Expands and contracts the hidden dimension.
         self.mlp = MLP(config)
-
     def forward(self, x):
-        # Apply LayerNorm → Attention, then add back the original input (residual connection).
-        # This means: new_x = x + Attention(LayerNorm(x))
         x = x + self.attn(self.ln_1(x))
-
-        # Apply LayerNorm → MLP, then again add residual connection.
-        # new_x = x + MLP(LayerNorm(x))
         x = x + self.mlp(self.ln_2(x))
-
-        # Return the updated hidden states.
         return x
 
-# =======================================
-# The @dataclass decorator automatically generates
-# useful methods for the class (like __init__, __repr__).
-# This makes it very convenient to define configuration objects
-# with default values and type hints.
-# =======================================
+
 @dataclass
 class GPTConfig:
-    # Maximum context length (sequence length) the model can handle.
-    # Example: 256 means the model can look at 256 tokens at once.
-    block_size: int = 1024    # max sequence length (GPT-2 context window)
+    block_size: int = 1024
+    vocab_size: int = 50257
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
 
-    # Size of the vocabulary (number of unique tokens/characters/words).
-    # Each token ID in [0, vocab_size) maps to an embedding vector.
-    vocab_size: int = 50257   # vocabulary size (BPE tokens)
 
-    # Number of Transformer blocks (layers) to stack in the model.
-    # Each block = self-attention + feed-forward + residual connections.
-    n_layer: int = 12         # number of transformer layers
-
-    # Number of attention heads inside each multi-head attention layer.
-    # Each head learns different "attention patterns".
-    n_head: int = 12          # number of attention heads
-
-    # Dimensionality of the embedding vector for each token.
-    # Also the hidden size of the model (width of the layers).
-    n_embd: int = 768         # embedding/hidden dimension
-
-# =========================================================
-# Define the main GPT model class, which inherits from PyTorch's nn.Module.
-# The skeleton of GPT2.
-# tokens → embeddings + positions → stacked transformer blocks → normalization → linear head → logits
-# =========================================================
 class GPT(nn.Module):
-
     def __init__(self, config):
+
         super().__init__()
         self.config = config
 
-        # Transformer core components
         self.transformer = nn.ModuleDict(dict(
-            # Token embeddings: convert token IDs → embedding vectors
+            # word token embedding
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            # Positional embeddings: encode positions [0..block_size) → vectors
+            # word position embedding
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            # Stack of Transformer blocks (n_layer deep)
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            # Final LayerNorm after all blocks
+            # blocks
+            h   = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            # NOTE: the last layer normalization
             ln_f = nn.LayerNorm(config.n_embd),
         ))
-        # Language modeling head: project hidden states back to vocab size
+        # output head
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        # NOTE: fix bug
-        # weight sharing scheme:
-        # details: attention is all you need paper and 30-th refer
-        # one way to do it
+        # weight tying
         self.transformer.wte.weight = self.lm_head.weight
+        # initialize
+        self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        # Check if the module is a Linear layer (nn.Linear)
+        # init linear layers
         if isinstance(module, nn.Linear):
-            # Initialize weights from a normal distribution
-            # mean = 0.0, std = 0.02
+            # gaussian w∼N(0,0.022) (from gpt-2 and BERT)
             std = 0.02
-
+            # tag sacling
+            # std=0.02×2×nlayer−0.5​
+            # from DeepNorm / GPT-2 scaling law
             if hasattr(module, "NANOGPT_SCALE_INIT"):
-                std *= 2 * (self.config.n_layers) ** -0.5
+                std *= 2 * (self.config.n_layer ** -0.5)
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-
-            # If the Linear layer has a bias term, set it to zeros
+            # initialize bias: zero initialize
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-
-        # Check if the module is an Embedding layer (nn.Embedding)
+        # init word and position embeddings
         elif isinstance(module, nn.Embedding):
-            # Initialize embedding weights from the same normal distribution
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-
     def forward(self, idx, targets=None):
-        '''
-        Input token IDs → convert to token embeddings
-        Add position embeddings (so model knows order)
-        Pass through stacked Transformer blocks (attention + MLP)
-        Apply final LayerNorm
-        Project to vocabulary logits (next-token prediction)
-        '''
-        # idx is the input sequence of token IDs
-        # Shape: (B, T) where:
-        #   B = batch size (number of sequences)
-        #   T = sequence length (number of tokens in each sequence)
+        # B (batch size)
+        # T (sequence length)
+        # sanity check
         B, T = idx.size()
+        assert T <= self.config.block_size
 
-        # Ensure sequence length does not exceed the maximum context length (block_size).
-        # If T > block_size, the model cannot handle it and raises an error.
-        assert T <= self.config.block_size, (
-            f"Cannot forward sequence of length {T}, "
-            f"block size is only {self.config.block_size}"
-        )
-
-        # -------------------------------------------------------
-        # 1. Compute position indices
-        # torch.arange(0, T) creates [0, 1, 2, ..., T-1]
-        # Shape: (T,)
+        # add word embeddings and pos embeddings
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        x = self.transformer.wte(idx) + self.transformer.wpe(pos)
 
-        # 2. Get position embeddings
-        # Each position (0..T-1) maps to a learned embedding vector.
-        # Shape: (T, n_embd)
-        pos_emb = self.transformer.wpe(pos)
-
-        # 3. Get token embeddings
-        # Each token ID in idx maps to its embedding vector.
-        # Shape: (B, T, n_embd)
-        tok_emb = self.transformer.wte(idx)
-
-        # 4. Add token embeddings + position embeddings
-        # Broadcasting happens: pos_emb (T, n_embd) is added to each sequence in tok_emb.
-        # Result shape: (B, T, n_embd)
-        x = tok_emb + pos_emb
-
-        # -------------------------------------------------------
-        # 5. Pass through all Transformer blocks (stacked layers).
-        # Each block applies: LayerNorm → Self-Attention → MLP → Residual connections
+        # send x to blocks
         for block in self.transformer.h:
-            x = block(x)   # still (B, T, n_embd)
-
-        # -------------------------------------------------------
-        # 6. Final layer normalization before output
-        # Shape: (B, T, n_embd)
+            x = block(x)
+        # last layer: LayerNorm
         x = self.transformer.ln_f(x)
 
-
-        # 7. Project hidden states to vocabulary logits
-        # Linear layer maps each embedding (n_embd) → vocab_size
-        # Shape: (B, T, vocab_size)
+        # cal loss
         logits = self.lm_head(x)
-
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
                                    targets.view(-1))
-
-        # -------------------------------------------------------
-        # Return raw logits (before softmax).
-        # Each position has a probability distribution over the vocabulary.
         return logits, loss
 
+    # -------------------
+    # 1.Group the model parameters
+    # 2.Determine which ones should have weight decay applied
+    # 3.Select the most appropriate version of AdamW
+    # (including CUDA-accelerated variants)
+    # 4.Finally return the optimizer object
+    # -------------------
+    def configure_optimizers(self, weight_decay, learning_rate, device,
+                             master_process=True):
+        # collect params
+        # requires_grad is true
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
 
-    # ===========================================================
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """Load pretrained GPT-2 model weights from HuggingFace checkpoints"""
+        # group params
+        # dim >= 2: usually params matrices
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        # dim < 2: shape transfer or bias or hypers
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
 
-        # ✅ Step 1: Ensure the requested model_type is valid
-        # We only allow official GPT-2 variants (small, medium, large, xl).
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-
-        # Import HuggingFace's GPT-2 implementation
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # ✅ Step 2: Choose architecture hyperparameters based on model_type
-        # Each GPT-2 variant has a different depth (n_layer), number of heads (n_head),
-        # and hidden embedding size (n_embd).
-        # These define the size of the neural network.
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),   # ~124M parameters
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # ~350M parameters
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # ~774M parameters
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # ~1558M parameters
-        }[model_type]
-
-        # ✅ Step 3: Add GPT-2 constants
-        # Vocabulary size and context window size are always fixed for GPT-2 models.
-        config_args['vocab_size'] = 50257   # GPT-2 BPE vocabulary size
-        config_args['block_size'] = 1024    # Max sequence length (context size)
-
-        # ✅ Step 4: Create our own GPT model (from scratch) with this config
-        # This initializes random weights, not pretrained ones yet.
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-
-        # ✅ Step 5: Collect the parameter dictionary of our model
-        # `state_dict` = all learnable parameters (weights, biases)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-
-        # Remove the attention bias mask from our keys
-        # Because this buffer is not learnable (just a causal mask).
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
-
-        # ------------------------------------------------------
-        # ✅ Step 6: Load HuggingFace's pretrained GPT-2 model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # ✅ Step 7: Clean up HuggingFace parameter keys
-        # They also have some buffer parameters we don’t care about.
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
-
-        # ✅ Step 8: Define which weights need transposition
-        # HuggingFace uses a custom "Conv1D" layer for efficiency,
-        # while our implementation uses standard nn.Linear.
-        # Conv1D stores weights as (out_features, in_features),
-        # while nn.Linear expects (in_features, out_features).
-        # → So we need to transpose these weights when copying.
-        transposed = [
-            'attn.c_attn.weight',   # Attention QKV projection
-            'attn.c_proj.weight',   # Attention output projection
-            'mlp.c_fc.weight',      # MLP expansion layer
-            'mlp.c_proj.weight'     # MLP projection layer
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
         ]
 
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}")
 
-        # Sanity check: number of parameters must match
-        assert len(sd_keys_hf) == len(sd_keys), \
-            f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        # fused adamW
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
 
-        # Iterate over all parameters and copy weights
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # Special case: transpose Conv1D → Linear
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # Direct copy for normal parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
 
-        return model
+        # instace optimizer
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate,
+            betas=(0.9, 0.95), eps=1e-8, fused=use_fused
+        )
+        return optimizer
 
 
-import tiktoken   # OpenAI's fast tokenizer library, here we use GPT-2 BPE encoding
+# ============================================================
+# 2. Data Loader (tokenized batching)
+# ============================================================
 
 class DataLoaderLite:
-    def __init__(self, B, T):
-        """
-        Initialize the data loader.
-
-        Args:
-            B (int): batch size (number of sequences per batch)
-            T (int): sequence length (number of tokens per sequence)
-        """
-        self.B = B
-        self.T = T
-
-        # ---------------------------------------------------------
-        # 1. Load raw text from disk and encode it into tokens
-        # ---------------------------------------------------------
+    def __init__(self, B, T, process_rank, num_processes):
+        self.B, self.T = B, T
+        self.process_rank, self.num_processes = process_rank, num_processes
         with open('input.txt', 'r') as f:
-            text = f.read()   # read the whole file into a string
-        enc = tiktoken.get_encoding('gpt2')  # use GPT-2 tokenizer
-        tokens = enc.encode(text)            # convert text → list of token IDs
-        self.tokens = torch.tensor(tokens)   # store as PyTorch tensor
-
-        print(f"loaded {len(self.tokens)} tokens")  # total number of tokens in dataset
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
-        # Explanation:
-        # - One "epoch" means processing the entire dataset once.
-        # - Each batch consumes B*T tokens.
-        # - So total number of batches per epoch = total_tokens // (B*T)
-
-        # ---------------------------------------------------------
-        # 2. Initialize state (where we are in the dataset)
-        # ---------------------------------------------------------
-        self.current_position = 0   # index pointer into the token tensor
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        self.tokens = torch.tensor(enc.encode(text))
+        print(f"loaded {len(self.tokens)} tokens")
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
-        """
-        Return the next batch of training data (x, y).
-        Each batch is shaped:
-            x: (B, T) input tokens
-            y: (B, T) target tokens (shifted by 1)
-        """
         B, T = self.B, self.T
-
-        # ---------------------------------------------------------
-        # 1. Slice a chunk of (B*T + 1) tokens from the dataset.
-        # We need +1 because y is shifted by one token relative to x.
-        # ---------------------------------------------------------
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-
-        # ---------------------------------------------------------
-        # 2. Create input (x) and target (y) sequences.
-        # - x is all but the last token, reshaped into (B, T)
-        # - y is all but the first token, reshaped into (B, T)
-        # Example:
-        #   buf = [t1, t2, t3, t4, t5]
-        #   x   = [t1, t2, t3, t4]
-        #   y   = [t2, t3, t4, t5]
-        # ---------------------------------------------------------
-        x = (buf[:-1]).view(B, T)  # inputs
-        y = (buf[1:]).view(B, T)   # targets
-
-        # ---------------------------------------------------------
-        # 3. Advance the current position by B*T tokens.
-        # This means "move forward one batch".
-        # ---------------------------------------------------------
-        self.current_position += B * T
-
-        # ---------------------------------------------------------
-        # 4. If we've reached the end of the dataset,
-        # reset back to the beginning for the next epoch.
-        # ---------------------------------------------------------
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
-
-        # ---------------------------------------------------------
-        # 5. Return a pair (x, y) for training.
-        # ---------------------------------------------------------
+        buf = self.tokens[self.current_position : self.current_position + B*T + 1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_position += B * T * self.num_processes
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
 
-# --------------------------------------------------------------
-# Test: load small GPT-2 (124M) and check if it runs
-import time
-# attempt to autodetect the device
-device = "cpu"
+# ============================================================
+# 3. DDP Initialization
+# (check if the environment support ddp, else return to initial state)
+# ============================================================
 
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
+# -1 -> no ddp
+ddp = int(os.environ.get('RANK', -1)) != -1
+# if  now  is in ddp mode
+if ddp:
+    assert torch.cuda.is_available(), "CUDA required for DDP"
+    # communication group
+    init_process_group(backend='nccl')
+    # global ranke
+    ddp_rank = int(os.environ['RANK'])
+    # local rank of  gpu of curent machine
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    # # of gpus
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    # tie process with each gpu
+    # rank 0 → cuda:0
+    # rank 1 → cuda:1
+    # rank 2 → cuda:2
+    # rank 3 → cuda:3
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    # main process
+    master_process = ddp_rank == 0
 
-print(f"using device: {device}")
+# do not support ddp
+else:
+    ddp_rank = ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = 'cuda' if torch.cuda.is_available() else \
+             'mps' if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else 'cpu'
+    print(f"using device: {device}")
 
-# Set seed for reproducibility
+
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-# get a data batch
-# import tiktoken
-# enc = tiktoken.get_encoding('gpt2')
-# with open('input.txt', 'r') as f:
-#     text = f.read()
-# text = text[:1000]
-# tokens = enc.encode(text)
-# B, T = 4, 32
-# buf = torch.tensor(tokens[:B*T + 1])
-# # NOTE: be careful
-# buf = buf.to(device)
-# x = buf[:-1].view(B, T)
-# y = buf[1:].view(B, T)
 
-train_loader = DataLoaderLite(B=16, T=1024)
+# ============================================================
+# 4. Training Loop
+# ============================================================
 
-# to see the difference
+total_batch_size = 524288
+B, T = 16, 1024
+assert total_batch_size % (B * T * ddp_world_size) == 0
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated grad accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B, T, ddp_rank, ddp_world_size)
 torch.set_float32_matmul_precision('high')
-# get logits
-model = GPT(GPTConfig(vocab_size=50304))
 
-model.to(device)
+model = GPT(GPTConfig(vocab_size=50304)).to(device)
+
+# trick to accelerate
+# compile the doc
 model = torch.compile(model)
-# logits, loss = model(x, y)
 
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
-## --------------------------- learning rate scheduler -----------------------
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+optimizer = raw_model.configure_optimizers(0.1, 6e-4, device, master_process)
+
+# gradient schedule
+max_lr, min_lr, warmup_steps, max_steps = 6e-4, 6e-5, 10, 50
 def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
     if it > max_steps:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
     decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
-
-# ============================================================
-# Optimization loop: trains the model parameters using AdamW
-# ============================================================
-
-# Create the optimizer.
-# - AdamW = Adam optimizer with decoupled weight decay (better for transformers).
-# - model.parameters() tells the optimizer which parameters to update.
-# - lr = learning rate, 3e-4 means step size for each parameter update.
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95)
-                              ,eps=1e-8)
-
-# Training loop for 50 iterations (steps).
+# grad accum
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-
-    # --------------------------------------------------------
-    # 1. Zero out (reset) the gradients from the previous step.
-    # PyTorch accumulates gradients by default, so we must clear
-    # them before each backward pass.
-    optimizer.zero_grad()
-
-    # --------------------------------------------------------
-    # 2. Forward pass: feed input (x) and target (y) into the model.
-    # The model returns:
-    #   - logits: raw predictions of shape (B, T, vocab_size)
-    #   - loss:   cross-entropy loss between logits and y
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-
-    # --------------------------------------------------------
-    # 3. Backward pass: compute gradients of the loss
-    # with respect to all learnable parameters in the model.
-    # This uses automatic differentiation.
-    loss.backward()
+    optimizer.zero_grad(set_to_none=True)
+    loss_accum = torch.tensor(0.0, device=device)
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        # autocast
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-    # --------------------------------------------------------
-    # 4. Optimization step: update parameters using the computed gradients.
-    # Each parameter θ is updated like:
-    #   θ_new = θ_old - lr * gradient(θ)
-    # determine and set the learning rate for this iteration
     lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    for pg in optimizer.param_groups:
+        pg['lr'] = lr
     optimizer.step()
+    torch.cuda.synchronize()
+    dt = time.time() - t0
+    tokens_processed = B * T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt
+    if master_process:
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | "
+              f"norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
-    # --------------------------------------------------------
-    # 5. Print training progress.
-    # .item() converts a PyTorch scalar tensor to a regular Python float.
-    torch.cuda.synchronize() # wait for the GPU to finish work
-    t1 = time.time()
-    dt = (t1 - t0)*1000 # time difference in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+# ============================================================
+# 5. Inference
+# ============================================================
+# cut process to release resources
+if ddp: destroy_process_group()
 
-
-
-# exit if needed
-import sys; sys.exit(0)
-
- # --------------------------------------------------------
- # Inference
-  # --------------------------------------------------------
-
-# prefix tokens
 model.eval()
-num_return_sequences = 5
-max_length = 30
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
 
-# prefix tokens
-import tiktoken
+# infer hyper params
+num_return_sequences = 3
+max_length = 40
+
 enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to('cuda')
+prefix = "Hello, I'm a language model,"
 
-# generate! right now x is (B, T) where B = 5, T = 8
-# set the seed to 42
+# tokenize using OpenAI tiktoken
+tokens = torch.tensor(enc.encode(prefix), dtype=torch.long) \
+            .unsqueeze(0).repeat(num_return_sequences, 1).to(device)
+
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x) # (B, T, vocab_size)
-        # take the logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        # note: multinomial does not demand the input to sum to 1
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append to the sequence
-        x = torch.cat((x, xcol), dim=1)
 
-# print the generated text
+while tokens.size(1) < max_length:
+    with torch.no_grad():
+        logits, _ = model(tokens)
+        # auto regression
+        logits = logits[:, -1, :]
+        probs = F.softmax(logits, dim=-1)
+        # keep first 50 words
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # random select
+        ix = torch.multinomial(topk_probs, 1)
+        xcol = torch.gather(topk_indices, -1, ix)
+        tokens = torch.cat((tokens, xcol), dim=1)
+
+# tokens to sentences
 for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+    decoded = enc.decode(tokens[i, :max_length].tolist())
+    print(f"> {decoded}")
