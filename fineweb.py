@@ -14,6 +14,7 @@ import tiktoken
 from datasets import load_dataset # pip install datasets
 from tqdm import tqdm # pip install tqdm
 
+
 # Path
 local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
@@ -21,9 +22,13 @@ shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
+# fw = load_dataset("HuggingFaceFW/fineweb-edu",
+#                   name=remote_name,
+#                   split="train")
+# Use MVP first
 fw = load_dataset("HuggingFaceFW/fineweb-edu",
                   name=remote_name,
-                  split="train")
+                  split="train[:0.1%]")
 
 # init tokenizer
 enc = tiktoken.get_encoding("gpt2")
