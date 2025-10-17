@@ -404,8 +404,15 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 enc = tiktoken.get_encoding("gpt2")
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B, T = 64, 1024 # micro batch size and sequence length
+# ---------------------------
+# srs training
+# total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+# B, T = 64, 1024 # micro batch size and sequence length
+# ---------------------------
+# small validation
+total_batch_size = 8192
+B, T = 4, 128
+max_steps = 20
 
 assert total_batch_size % (B * T * ddp_world_size) == 0
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -440,9 +447,10 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch,
+# ---------------- srs
+#max_steps = 19073 # 19,073 steps is ~1 epoch,
 # if data is 10B tokens and batch size 0.5M tokens
-
+max_steps = 20
 
 
 
