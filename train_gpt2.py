@@ -1,7 +1,6 @@
 # ============================================================
 #  GPT-2 Distributed Training & Inference
 # ============================================================
-#  Author: Hortus He
 #  Compatible with: PyTorch ≥ 2.0
 #  Features:
 #     - Supports single-GPU or multi-GPU via torchrun (DDP)
@@ -11,6 +10,7 @@
 # ============================================================
 
 import os, math, time
+import numpy as np
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -20,6 +20,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import tiktoken
 import inspect
+
+from hellaswag import render_example, iterate_examples
 
 
 # ============================================================
@@ -205,16 +207,38 @@ class GPT(nn.Module):
 # 2. Data Loader (tokenized batching)
 # ============================================================
 
+# fineweb load shards
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B, self.T = B, T
-        self.process_rank, self.num_processes = process_rank, num_processes
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        self.tokens = torch.tensor(enc.encode(text))
-        print(f"loaded {len(self.tokens)} tokens")
+        self.process_rank, self.num_processes = process_rank, \
+        num_processes
+
+        assert split in {'train', 'val'}
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+
+
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        self.reset()
         self.current_position = self.B * self.T * self.process_rank
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+
+
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -222,10 +246,36 @@ class DataLoaderLite:
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
         self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds, advance to next shard
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
         return x, y
 
+    # -----------------------------------------------------------------------------
+    # helper function for HellaSwag eval
+    # takes tokens, mask, and logits, returns the index of
+    # the completion with the lowest loss
+
+    def get_most_likely_row(tokens, mask, logits):
+        # evaluate the autoregressive loss at all positions
+        shift_logits = (logits[..., :-1, :]).contiguous()
+        shift_tokens = (tokens[..., 1:]).contiguous()
+        flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+        flat_shift_tokens = shift_tokens.view(-1)
+        shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+        shift_losses = shift_losses.view(tokens.size(0), -1)
+        # now get the average loss just for the completion region (where mask == 1), in each row
+        shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+        masked_shift_losses = shift_losses * shift_mask
+        # sum and divide by the number of 1s in the mask
+        sum_loss = masked_shift_losses.sum(dim=1)
+        avg_loss = sum_loss / shift_mask.sum(dim=1)
+        # now we have a loss for each of the 4 completions
+        # the one with the lowest loss should be the most likely
+        pred_norm = avg_loss.argmin().item()
+        return pred_norm
 
 # ============================================================
 # 3. DDP Initialization
@@ -275,21 +325,31 @@ if torch.cuda.is_available():
 # ============================================================
 
 total_batch_size = 524288
-B, T = 16, 1024
+B, T = 64, 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated grad accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B, T, ddp_rank, ddp_world_size)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank,
+                              num_processes=ddp_world_size,
+                              split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank,
+                            num_processes=ddp_world_size,
+                            split="val")
+
+
 torch.set_float32_matmul_precision('high')
 
 model = GPT(GPTConfig(vocab_size=50304)).to(device)
 
 # trick to accelerate
 # compile the doc
-model = torch.compile(model)
+use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+if use_compile:
+    model = torch.compile(model)
+
 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -297,8 +357,17 @@ raw_model = model.module if ddp else model
 
 optimizer = raw_model.configure_optimizers(0.1, 6e-4, device, master_process)
 
+
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
+
+
 # gradient schedule
-max_lr, min_lr, warmup_steps, max_steps = 6e-4, 6e-5, 10, 50
+max_lr, min_lr, warmup_steps, max_steps = 6e-4, 6e-5, 715, 19073
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -309,8 +378,71 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # grad accum
+# update: validation and hellaswag
 for step in range(max_steps):
     t0 = time.time()
+    last_step = (step == max_steps - 1)
+
+    # once in a while evaluate our validation loss
+    if step % 250 == 0 or last_step:
+
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device,
+                                    dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+
+    # once in a while evaluate hellaswag
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and labels
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
+
+    # training loop
+    model.train()
+
+
     optimizer.zero_grad(set_to_none=True)
     loss_accum = torch.tensor(0.0, device=device)
     for micro_step in range(grad_accum_steps):
@@ -336,9 +468,9 @@ for step in range(max_steps):
     tokens_processed = B * T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | "
-              f"norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} \
+              | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms \
+              | tok/sec: {tokens_per_sec:.2f}")
 # ============================================================
 # 5. Inference
 # ============================================================
